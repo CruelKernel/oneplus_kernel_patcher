@@ -1,0 +1,202 @@
+name: Check OnePlus Open Firmware (IN)
+
+on:
+  schedule:
+    # Run daily at 6 AM UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    # Allow manual trigger
+
+jobs:
+  extract-and-patch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Free up disk space
+        run: |
+          echo "=== Disk space before cleanup ==="
+          df -h /
+
+          # Remove unnecessary tools to free up space (~25GB)
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force 2>/dev/null || true
+
+          echo "=== Disk space after cleanup ==="
+          df -h /
+
+      - name: Check for new firmware
+        id: check
+        run: |
+          # Get firmware info
+          ./download_firmware.py --variant 14 --check-only --json > firmware.json
+          cat firmware.json
+
+          # Extract version info
+          VERSION=$(jq -r '.version_number' firmware.json)
+          FILENAME=$(jq -r '.filename' firmware.json)
+          OTA_VERSION=$(jq -r '.ota_version_number' firmware.json)
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "filename=$FILENAME" >> $GITHUB_OUTPUT
+          echo "ota_version=$OTA_VERSION" >> $GITHUB_OUTPUT
+
+          # Compare with stored version
+          if [ -f current_version.txt ]; then
+            CURRENT=$(cat current_version.txt)
+            echo "Current version: $CURRENT"
+            echo "Latest version: $VERSION"
+            if [ "$VERSION" = "$CURRENT" ]; then
+              echo "No update available"
+              echo "need_update=false" >> $GITHUB_OUTPUT
+            else
+              echo "New version available!"
+              echo "need_update=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "No version file found - first run"
+            echo "need_update=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download firmware
+        if: steps.check.outputs.need_update == 'true'
+        run: |
+          echo "=== Downloading firmware ==="
+          ./download_firmware.py --variant 14 -n 8 --no-clobber
+
+      - name: Extract payload.bin
+        if: steps.check.outputs.need_update == 'true'
+        run: |
+          echo "=== Extracting payload.bin from firmware ==="
+          FIRMWARE_FILE="${{ steps.check.outputs.filename }}"
+
+          # Extract only payload.bin from the ZIP
+          unzip -j "$FIRMWARE_FILE" payload.bin
+
+          # Remove the firmware ZIP to free space
+          rm -f "$FIRMWARE_FILE"
+
+      - name: Extract boot partitions
+        if: steps.check.outputs.need_update == 'true'
+        run: |
+          echo "=== Extracting boot partitions from payload.bin ==="
+          ./extract_payload.py payload.bin -p boot init_boot vendor_boot vendor_dlkm vbmeta dtbo -o .
+
+          # Remove payload.bin to free space
+          rm -f payload.bin
+
+      - name: Download Magisk
+        id: magisk
+        if: steps.check.outputs.need_update == 'true'
+        run: |
+          echo "=== Downloading latest Magisk release APK ==="
+          MAGISK_URL=$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/latest \
+            | jq -r '.assets[] | select(.name | startswith("Magisk-v")) | .browser_download_url')
+
+          MAGISK_VERSION=$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/latest \
+            | jq -r '.tag_name')
+
+          echo "Downloading Magisk $MAGISK_VERSION from: $MAGISK_URL"
+          wget -q "$MAGISK_URL" -O magisk.apk
+
+          echo "magisk_version=$MAGISK_VERSION" >> $GITHUB_OUTPUT
+          ls -lh magisk.apk
+
+      - name: Patch boot image with Magisk
+        id: patch
+        if: steps.check.outputs.need_update == 'true'
+        run: |
+          echo "=== Patching init_boot.img with Magisk ==="
+          ./patch_boot.sh init_boot.img magisk.apk
+
+          echo "=== Patching complete ==="
+          ls -lh *.img
+
+      - name: Update version file
+        if: steps.check.outputs.need_update == 'true'
+        run: |
+          echo "${{ steps.check.outputs.version }}" > current_version.txt
+
+      - name: Commit version update
+        if: steps.check.outputs.need_update == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add current_version.txt
+          git diff --staged --quiet || git commit -m "Update firmware version to ${{ steps.check.outputs.version }}"
+          git push
+
+      - name: Create Release
+        if: steps.check.outputs.need_update == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.check.outputs.version }}
+          name: OnePlus Open ${{ steps.check.outputs.version }}
+          body: |
+            ## OnePlus Open Firmware ${{ steps.check.outputs.version }}
+
+            **OTA Version:** ${{ steps.check.outputs.ota_version }}
+            **Magisk Version:** ${{ steps.magisk.outputs.magisk_version }}
+
+            ### Included files
+            - `init_boot.img` - Stock init_boot image (for backup/restore)
+            - `boot.img` - Stock boot image (for backup/restore)
+            - `vendor_boot.img` - Stock vendor_boot image (vendor ramdisk/modules)
+            - `vendor_dlkm.img` - Stock vendor_dlkm image (kernel modules)
+            - `vbmeta.img` - Stock vbmeta image (verified boot metadata)
+            - `dtbo.img` - Stock dtbo image (device tree overlay)
+            - `magisk_patched_init_boot.img` - Magisk patched init_boot image
+
+            ### Flashing instructions
+
+            1. **Backup first!** Save your current init_boot partition
+            2. Boot into fastboot mode: `adb reboot bootloader`
+            3. Flash patched image:
+               ```
+               fastboot flash init_boot magisk_patched_init_boot.img
+               ```
+            4. Reboot: `fastboot reboot`
+            5. Install Magisk app from [GitHub releases](https://github.com/topjohnwu/Magisk/releases)
+
+            ### Restore stock
+            If you need to restore stock partitions:
+            ```
+            fastboot flash init_boot init_boot.img
+            fastboot flash boot boot.img
+            fastboot flash vendor_boot vendor_boot.img
+            fastboot flash vendor_dlkm vendor_dlkm.img
+            fastboot flash dtbo dtbo.img
+            fastboot flash vbmeta vbmeta.img
+            ```
+
+            ---
+            *Automatically generated by GitHub Actions*
+          files: |
+            init_boot.img
+            boot.img
+            vendor_boot.img
+            vendor_dlkm.img
+            vbmeta.img
+            dtbo.img
+            magisk_patched_init_boot.img
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Workflow Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.check.outputs.need_update }}" == "true" ]; then
+            echo "- **Status:** New firmware processed" >> $GITHUB_STEP_SUMMARY
+            echo "- **Version:** ${{ steps.check.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **OTA Version:** ${{ steps.check.outputs.ota_version }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Status:** No update available" >> $GITHUB_STEP_SUMMARY
+            echo "- **Current Version:** $(cat current_version.txt 2>/dev/null || echo 'N/A')" >> $GITHUB_STEP_SUMMARY
+          fi

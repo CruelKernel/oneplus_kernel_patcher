@@ -26,9 +26,9 @@ A GitHub Actions workflow runs daily to:
 1. Check for new OnePlus Open (India) firmware via the OxygenOS Updater API
 2. Download the firmware if a new version is available
 3. Extract `payload.bin` from the firmware ZIP
-4. Extract `init_boot.img` from the payload
+4. Extract `init_boot.img`, `boot.img`, and `vendor_dlkm.img` from the payload
 5. Patch the boot image with the latest Magisk
-6. Create a GitHub release with both stock and patched images
+6. Create a GitHub release with stock and patched images
 
 ## Manual Usage
 
@@ -58,8 +58,8 @@ python download_firmware.py --no-clobber
 # List available partitions
 python extract_payload.py payload.bin -l
 
-# Extract init_boot
-python extract_payload.py payload.bin -p init_boot -o .
+# Extract init_boot, boot, and vendor_dlkm
+python extract_payload.py payload.bin -p init_boot boot vendor_dlkm -o .
 ```
 
 ### Patch boot image
