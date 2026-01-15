@@ -1,0 +1,9 @@
+payload.bin
+*.zip
+__pycache__
+*.img
+*.apk
+*.so
+magisk/
+extracted/
+firmware.json
